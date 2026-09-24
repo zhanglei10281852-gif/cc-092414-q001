@@ -60,3 +60,8 @@ class RiskDecision(BaseModel):
     reason: str = Field(..., min_length=1, max_length=300)
     operator: str = Field(..., min_length=1, max_length=80)
 
+
+class ArchiveRequest(BaseModel):
+    operator: str = Field(..., min_length=1, max_length=80)
+    reason: str = Field(default="", max_length=300)
+

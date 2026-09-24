@@ -96,6 +96,15 @@ CREATE TABLE IF NOT EXISTS food_audit (
     payload_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS food_lot_archives (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lot_id INTEGER NOT NULL,
+    lot_code TEXT NOT NULL,
+    operator TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    snapshot_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_food_samples_lot ON food_samples(lot_id, collected_at);
 CREATE INDEX IF NOT EXISTS idx_food_results_sample ON food_test_results(sample_id, tested_at);
 CREATE INDEX IF NOT EXISTS idx_food_shipments_lot ON food_shipments(lot_id, departure_at);
@@ -116,6 +125,15 @@ def _dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 def _result_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+class LotConflictError(Exception):
+    """批次仍存在关联记录，禁止直接删除。"""
+
+    def __init__(self, lot_id: int, blockers: dict[str, list[dict[str, Any]]]) -> None:
+        super().__init__("lot_has_related_records")
+        self.lot_id = lot_id
+        self.blockers = blockers
 
 
 class FoodService:
@@ -234,10 +252,96 @@ class FoodService:
         temperature_count = self.connection.execute("SELECT COUNT(*) FROM food_temperatures t JOIN food_shipments s ON s.id=t.shipment_id WHERE s.lot_id=?", (lot_id,)).fetchone()[0]
         return {"lot": lot, "sample_count": sample_count, "result_count": result_count, "failed_count": failed_count, "temperature_count": temperature_count}
 
-    def delete_lot(self, lot_id: int) -> bool:
-        """移除尚未关联记录的批次；关联记录的错误映射由上层负责。"""
+    def _append_audit(self, connection: sqlite3.Connection, lot_id: int, action: str, actor: str, payload: dict[str, Any]) -> None:
+        connection.execute(
+            "INSERT INTO food_audit(lot_id,action,actor,payload_json,created_at) VALUES(?,?,?,?,?)",
+            (lot_id, action, actor, json.dumps(payload, ensure_ascii=False), _now()),
+        )
+
+    def _lot_blockers(self, connection: sqlite3.Connection, lot_id: int) -> dict[str, list[dict[str, Any]]]:
+        """汇总阻止批次删除的关联记录，键位固定以保证冲突信息结构稳定。"""
+        samples = [dict(row) for row in connection.execute("SELECT id, sample_code, status FROM food_samples WHERE lot_id=? ORDER BY id", (lot_id,)).fetchall()]
+        sample_ids = [row["id"] for row in samples]
+        test_results: list[dict[str, Any]] = []
+        if sample_ids:
+            marks = ",".join("?" for _ in sample_ids)
+            test_results = [dict(row) for row in connection.execute(f"SELECT id, sample_id, analyte, verdict FROM food_test_results WHERE sample_id IN ({marks}) ORDER BY id", sample_ids).fetchall()]
+        shipments = [dict(row) for row in connection.execute("SELECT id, shipment_code, status FROM food_shipments WHERE lot_id=? ORDER BY id", (lot_id,)).fetchall()]
+        shipment_ids = [row["id"] for row in shipments]
+        temperatures: list[dict[str, Any]] = []
+        if shipment_ids:
+            marks = ",".join("?" for _ in shipment_ids)
+            temperatures = [dict(row) for row in connection.execute(f"SELECT id, shipment_id, recorded_at FROM food_temperatures WHERE shipment_id IN ({marks}) ORDER BY id", shipment_ids).fetchall()]
+        risk_actions = [dict(row) for row in connection.execute("SELECT id, decision, new_status FROM food_risk_actions WHERE lot_id=? ORDER BY id", (lot_id,)).fetchall()]
+        return {"samples": samples, "test_results": test_results, "shipments": shipments, "temperatures": temperatures, "risk_actions": risk_actions}
+
+    def _lot_snapshot(self, connection: sqlite3.Connection, lot_id: int) -> dict[str, Any]:
+        lot = dict(connection.execute("SELECT * FROM food_lots WHERE id=?", (lot_id,)).fetchone())
+        samples = [dict(row) for row in connection.execute("SELECT * FROM food_samples WHERE lot_id=? ORDER BY id", (lot_id,)).fetchall()]
+        for sample in samples:
+            sample["results"] = [dict(row) for row in connection.execute("SELECT * FROM food_test_results WHERE sample_id=? ORDER BY id", (sample["id"],)).fetchall()]
+        shipments = [dict(row) for row in connection.execute("SELECT * FROM food_shipments WHERE lot_id=? ORDER BY id", (lot_id,)).fetchall()]
+        for shipment in shipments:
+            shipment["temperatures"] = [dict(row) for row in connection.execute("SELECT * FROM food_temperatures WHERE shipment_id=? ORDER BY id", (shipment["id"],)).fetchall()]
+        risk_actions = [dict(row) for row in connection.execute("SELECT * FROM food_risk_actions WHERE lot_id=? ORDER BY id", (lot_id,)).fetchall()]
+        return {"lot": lot, "samples": samples, "shipments": shipments, "risk_actions": risk_actions}
+
+    def delete_lot(self, lot_id: int, actor: str = "system") -> dict[str, Any]:
+        """删除无关联记录的批次。
+
+        存在样品、检测结果、运输或风险处置记录时不改动任何业务数据，
+        仅提交一条 lot.delete_blocked 审计作为处理依据，随后抛出
+        LotConflictError，由路由层返回稳定的 409 冲突信息。
+        """
         with transaction(immediate=True) as connection:
-            cursor = connection.execute("DELETE FROM food_lots WHERE id=?", (lot_id,))
-            if cursor.rowcount == 0:
+            lot = connection.execute("SELECT * FROM food_lots WHERE id=?", (lot_id,)).fetchone()
+            if lot is None:
                 raise KeyError("lot_not_found")
-            return True
+            blockers = self._lot_blockers(connection, lot_id)
+            blocked = any(blockers.values())
+            if blocked:
+                self._append_audit(connection, lot_id, "lot.delete_blocked", actor, {"lot_code": lot["lot_code"], "blockers": blockers})
+            else:
+                connection.execute("DELETE FROM food_lots WHERE id=?", (lot_id,))
+                self._append_audit(connection, lot_id, "lot.delete", actor, {"lot_code": lot["lot_code"]})
+        if blocked:
+            raise LotConflictError(lot_id, blockers)
+        return {"id": lot_id, "lot_code": lot["lot_code"], "deleted": True}
+
+    def archive_lot(self, lot_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        """归档清理路径：先快照留存关联数据，再在同一事务中移除批次及全部关联记录。
+
+        任一步骤失败都会整体回滚，不会遗留半完成事务。
+        """
+        operator = payload["operator"]
+        reason = payload.get("reason", "")
+        with transaction(immediate=True) as connection:
+            lot = connection.execute("SELECT * FROM food_lots WHERE id=?", (lot_id,)).fetchone()
+            if lot is None:
+                raise KeyError("lot_not_found")
+            snapshot = self._lot_snapshot(connection, lot_id)
+            cursor = connection.execute(
+                "INSERT INTO food_lot_archives(lot_id,lot_code,operator,reason,snapshot_json,created_at) VALUES(?,?,?,?,?,?)",
+                (lot_id, lot["lot_code"], operator, reason, json.dumps(snapshot, ensure_ascii=False), _now()),
+            )
+            archive_id = int(cursor.lastrowid)
+            sample_ids = [row["id"] for row in connection.execute("SELECT id FROM food_samples WHERE lot_id=?", (lot_id,)).fetchall()]
+            shipment_ids = [row["id"] for row in connection.execute("SELECT id FROM food_shipments WHERE lot_id=?", (lot_id,)).fetchall()]
+            removed = {"temperatures": 0, "shipments": 0, "test_results": 0, "samples": 0, "risk_actions": 0}
+            if shipment_ids:
+                marks = ",".join("?" for _ in shipment_ids)
+                removed["temperatures"] = connection.execute(f"DELETE FROM food_temperatures WHERE shipment_id IN ({marks})", shipment_ids).rowcount
+            removed["shipments"] = connection.execute("DELETE FROM food_shipments WHERE lot_id=?", (lot_id,)).rowcount
+            if sample_ids:
+                marks = ",".join("?" for _ in sample_ids)
+                removed["test_results"] = connection.execute(f"DELETE FROM food_test_results WHERE sample_id IN ({marks})", sample_ids).rowcount
+            removed["samples"] = connection.execute("DELETE FROM food_samples WHERE lot_id=?", (lot_id,)).rowcount
+            removed["risk_actions"] = connection.execute("DELETE FROM food_risk_actions WHERE lot_id=?", (lot_id,)).rowcount
+            connection.execute("DELETE FROM food_lots WHERE id=?", (lot_id,))
+            self._append_audit(connection, lot_id, "lot.archive", operator, {"lot_code": lot["lot_code"], "reason": reason, "archive_id": archive_id, "removed": removed})
+            return {"archive_id": archive_id, "lot_id": lot_id, "lot_code": lot["lot_code"], "removed": removed}
+
+    def lot_audit(self, lot_id: int) -> list[dict[str, Any]]:
+        """批次审计轨迹；批次已删除时仍可查询，作为处理依据留存。"""
+        rows = self.connection.execute("SELECT * FROM food_audit WHERE lot_id=? ORDER BY id", (lot_id,)).fetchall()
+        return [dict(row) for row in rows]

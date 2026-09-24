@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import sqlite3
+
 from fastapi import APIRouter, HTTPException
 
-from app.food.schemas import LotCreate, RiskDecision, SampleCreate, ShipmentCreate, TemperatureRecord, TestResultCreate
-from app.food.service import FoodService
+from app.food.schemas import ArchiveRequest, LotCreate, RiskDecision, SampleCreate, ShipmentCreate, TemperatureRecord, TestResultCreate
+from app.food.service import FoodService, LotConflictError
 
 router = APIRouter(prefix="/api/food", tags=["食品安全"])
 
@@ -39,12 +41,47 @@ def summary(lot_id: int):
 
 
 @router.delete("/lots/{lot_id}")
-def delete_lot(lot_id: int):
+def delete_lot(lot_id: int, operator: str = "system"):
     try:
-        service().delete_lot(lot_id)
-        return {"message": "批次已删除"}
+        service().delete_lot(lot_id, actor=operator)
+        return {"message": "批次已删除", "lot_id": lot_id}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="批次不存在") from exc
+    except LotConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "批次存在关联记录，禁止直接删除",
+                "lot_id": exc.lot_id,
+                "blockers": exc.blockers,
+                "archive_hint": f"POST /api/food/lots/{exc.lot_id}/archive",
+            },
+        ) from exc
+    except sqlite3.IntegrityError as exc:
+        # 兜底：新增关联表时也不允许退化为 500
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "批次存在关联记录，禁止直接删除",
+                "lot_id": lot_id,
+                "blockers": {},
+                "archive_hint": f"POST /api/food/lots/{lot_id}/archive",
+            },
+        ) from exc
+
+
+@router.post("/lots/{lot_id}/archive", status_code=200)
+def archive_lot(lot_id: int, payload: ArchiveRequest):
+    try:
+        result = service().archive_lot(lot_id, payload.model_dump())
+        return {"message": "批次已归档清理", **result}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="批次不存在") from exc
+
+
+@router.get("/lots/{lot_id}/audit")
+def lot_audit(lot_id: int):
+    return {"lot_id": lot_id, "records": service().lot_audit(lot_id)}
 
 
 @router.post("/lots/{lot_id}/samples", status_code=201)

@@ -60,3 +60,9 @@ class RiskDecision(BaseModel):
     reason: str = Field(..., min_length=1, max_length=300)
     operator: str = Field(..., min_length=1, max_length=80)
 
+
+class ArchivePurgeRequest(BaseModel):
+    operator: str = Field(..., min_length=1, max_length=80)
+    reason: str = Field(..., min_length=1, max_length=300)
+    confirm: bool = Field(..., description="必须显式为 true 才执行归档清理")
+

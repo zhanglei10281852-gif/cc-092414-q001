@@ -1,8 +1,16 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 
-from app.food.schemas import LotCreate, RiskDecision, SampleCreate, ShipmentCreate, TemperatureRecord, TestResultCreate
+from app.food.schemas import (
+    ArchivePurgeRequest,
+    LotCreate,
+    RiskDecision,
+    SampleCreate,
+    ShipmentCreate,
+    TemperatureRecord,
+    TestResultCreate,
+)
 from app.food.service import FoodService
 
 router = APIRouter(prefix="/api/food", tags=["食品安全"])
@@ -39,12 +47,14 @@ def summary(lot_id: int):
 
 
 @router.delete("/lots/{lot_id}")
-def delete_lot(lot_id: int):
-    try:
-        service().delete_lot(lot_id)
-        return {"message": "批次已删除"}
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="批次不存在") from exc
+def delete_lot(lot_id: int, x_operator: str | None = Header(default=None, alias="X-Operator")):
+    service().delete_lot(lot_id, actor=x_operator or "anonymous")
+    return {"message": "批次已删除"}
+
+
+@router.post("/lots/{lot_id}/archive-purge")
+def archive_purge_lot(lot_id: int, payload: ArchivePurgeRequest, x_operator: str | None = Header(default=None, alias="X-Operator")):
+    return service().archive_purge_lot(lot_id, payload.model_dump(), actor=x_operator)
 
 
 @router.post("/lots/{lot_id}/samples", status_code=201)

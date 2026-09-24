@@ -6,7 +6,20 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
+from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.database import get_connection, transaction
+
+
+class LotDeletionConflictError(ConflictError):
+    """批次仍被样品/检测/运输等关联记录引用，禁止直接删除。"""
+
+    code = "lot_delete_conflict"
+
+
+class LotNotArchivedError(ConflictError):
+    """批次未进入销毁归档终态，不能执行归档清理。"""
+
+    code = "lot_not_archived"
 
 
 SCHEMA = """
@@ -234,10 +247,128 @@ class FoodService:
         temperature_count = self.connection.execute("SELECT COUNT(*) FROM food_temperatures t JOIN food_shipments s ON s.id=t.shipment_id WHERE s.lot_id=?", (lot_id,)).fetchone()[0]
         return {"lot": lot, "sample_count": sample_count, "result_count": result_count, "failed_count": failed_count, "temperature_count": temperature_count}
 
-    def delete_lot(self, lot_id: int) -> bool:
-        """移除尚未关联记录的批次；关联记录的错误映射由上层负责。"""
+    def _collect_lot_blockers(self, connection: sqlite3.Connection, lot_id: int) -> dict[str, Any]:
+        """汇总阻止批次直接删除的关联记录，信息保持稳定可复核。"""
+        samples = [
+            {"id": row["id"], "sample_code": row["sample_code"]}
+            for row in connection.execute(
+                "SELECT id,sample_code FROM food_samples WHERE lot_id=? ORDER BY id",
+                (lot_id,),
+            ).fetchall()
+        ]
+        shipments = [
+            {"id": row["id"], "shipment_code": row["shipment_code"]}
+            for row in connection.execute(
+                "SELECT id,shipment_code FROM food_shipments WHERE lot_id=? ORDER BY id",
+                (lot_id,),
+            ).fetchall()
+        ]
+        result_count = connection.execute(
+            "SELECT COUNT(*) FROM food_test_results r JOIN food_samples s ON s.id=r.sample_id WHERE s.lot_id=?",
+            (lot_id,),
+        ).fetchone()[0]
+        temperature_count = connection.execute(
+            "SELECT COUNT(*) FROM food_temperatures t JOIN food_shipments p ON p.id=t.shipment_id WHERE p.lot_id=?",
+            (lot_id,),
+        ).fetchone()[0]
+        risk_action_count = connection.execute(
+            "SELECT COUNT(*) FROM food_risk_actions WHERE lot_id=?",
+            (lot_id,),
+        ).fetchone()[0]
+        blockers = {
+            "lot_id": lot_id,
+            "samples": samples,
+            "sample_count": len(samples),
+            "result_count": result_count,
+            "shipments": shipments,
+            "shipment_count": len(shipments),
+            "temperature_count": temperature_count,
+            "risk_action_count": risk_action_count,
+        }
+        blockers["has_references"] = bool(
+            samples or shipments or result_count or temperature_count or risk_action_count
+        )
+        return blockers
+
+    def delete_lot(self, lot_id: int, actor: str = "regulator") -> bool:
+        """删除无关联记录的批次。
+
+        存在样品、检测结果、运输（含温控）或风险处置记录时抛出稳定的
+        409 冲突，业务数据保持不变；拒绝事件单独记账，作为处理依据。
+        关联批次只能通过 archive_purge_lot 的销毁归档清理路径处理。
+        """
+        try:
+            with transaction(immediate=True) as connection:
+                lot = connection.execute("SELECT id FROM food_lots WHERE id=?", (lot_id,)).fetchone()
+                if lot is None:
+                    raise NotFoundError("批次不存在")
+                blockers = self._collect_lot_blockers(connection, lot_id)
+                if blockers["has_references"]:
+                    raise LotDeletionConflictError(
+                        "批次存在关联的样品、检测结果、运输或风险处置记录，不能直接删除；请走销毁归档清理流程",
+                        context=blockers,
+                    )
+                now = _now()
+                connection.execute(
+                    "INSERT INTO food_audit(lot_id,action,actor,payload_json,created_at) VALUES(?,?,?,?,?)",
+                    (lot_id, "lot.delete", actor, json.dumps(blockers, ensure_ascii=False), now),
+                )
+                cursor = connection.execute("DELETE FROM food_lots WHERE id=?", (lot_id,))
+                if cursor.rowcount == 0:
+                    raise NotFoundError("批次不存在")
+                return True
+        except LotDeletionConflictError as exc:
+            # 外层事务已整体回滚（业务数据未变）；审计只追加一条拒绝记录并独立提交。
+            now = _now()
+            with transaction(immediate=True) as audit_connection:
+                audit_connection.execute(
+                    "INSERT INTO food_audit(lot_id,action,actor,payload_json,created_at) VALUES(?,?,?,?,?)",
+                    (lot_id, "lot.delete_rejected", actor, json.dumps(exc.context, ensure_ascii=False), now),
+                )
+            raise
+
+    def archive_purge_lot(self, lot_id: int, payload: dict[str, Any], actor: str | None = None) -> dict[str, Any]:
+        """明确的归档清理路径：仅允许清理已销毁（destroyed）批次及其关联数据。
+
+        所有删除与审计写入在同一事务内完成，任一步失败整体回滚，
+        不会留下只删了一半样品或运输单的中间状态。
+        """
+        operator = actor or payload.get("operator") or "regulator"
+        if not payload.get("confirm"):
+            raise ValidationError("归档清理必须显式确认（confirm=true）")
         with transaction(immediate=True) as connection:
+            lot = connection.execute("SELECT * FROM food_lots WHERE id=?", (lot_id,)).fetchone()
+            if lot is None:
+                raise NotFoundError("批次不存在")
+            if lot["status"] != "destroyed":
+                raise LotNotArchivedError(
+                    "只有已销毁归档的批次才能执行归档清理",
+                    context={"lot_id": lot_id, "current_status": lot["status"], "required_status": "destroyed"},
+                )
+            summary = self._collect_lot_blockers(connection, lot_id)
+            connection.execute(
+                "DELETE FROM food_temperatures WHERE shipment_id IN (SELECT id FROM food_shipments WHERE lot_id=?)",
+                (lot_id,),
+            )
+            connection.execute(
+                "DELETE FROM food_test_results WHERE sample_id IN (SELECT id FROM food_samples WHERE lot_id=?)",
+                (lot_id,),
+            )
+            connection.execute("DELETE FROM food_shipments WHERE lot_id=?", (lot_id,))
+            connection.execute("DELETE FROM food_samples WHERE lot_id=?", (lot_id,))
+            connection.execute("DELETE FROM food_risk_actions WHERE lot_id=?", (lot_id,))
+            now = _now()
+            connection.execute(
+                "INSERT INTO food_audit(lot_id,action,actor,payload_json,created_at) VALUES(?,?,?,?,?)",
+                (
+                    lot_id,
+                    "lot.archive_purge",
+                    operator,
+                    json.dumps({"reason": payload.get("reason", ""), **summary}, ensure_ascii=False),
+                    now,
+                ),
+            )
             cursor = connection.execute("DELETE FROM food_lots WHERE id=?", (lot_id,))
             if cursor.rowcount == 0:
-                raise KeyError("lot_not_found")
-            return True
+                raise NotFoundError("批次不存在")
+            return {"purged": True, "lot_id": lot_id, "cleared": summary}
